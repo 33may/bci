@@ -5,6 +5,13 @@ from typing import Dict, List, Tuple, Optional, Literal, Any
 from glob import glob
 import mne
 from loguru import logger as log
+from tqdm import tqdm
+import os
+import torch
+
+
+mne.set_log_level("ERROR")
+
 
 @dataclass
 class PreprocConfig:
@@ -36,9 +43,9 @@ class SaveConfig:
 
 
 class BCILoader:
-    def __init__(self, config: PreprocConfig, data_root: str):
+    def __init__(self, config: PreprocConfig, data_path: str):
         self.config = config
-        self.data_path = data_root
+        self.data_path = data_path
 
         self.files = self.find_files(data_path)
 
@@ -48,7 +55,10 @@ class BCILoader:
 
         log.debug(f"=== Train/Eval Separated ===== \n Train: {self.labels['counts']['train']} Eval: {self.labels['counts']['eval']}")
 
-        all_data = [self.load_raw(file_path) for file_path in self.files]
+        all_data = []
+        for file_path in tqdm(self.files, desc="Loading GDF files", unit="file", dynamic_ncols=True, leave=False):
+            all_data.append(self.load_raw(file_path)) 
+
         self.raw_files, self.events, self.event_ids = zip(*all_data)
 
         self.raw_files = list(self.raw_files)
@@ -62,7 +72,9 @@ class BCILoader:
         log.debug(f"=== Channesls renameds =====")
 
 
-    def find_files(self, data_root: str, pattern: str = "*.gdf") -> List[str]:
+
+
+    def find_files(self, data_path: str, pattern: str = "*.gdf") -> List[str]:
         files = glob(f"{data_path}/{pattern}")
         return files
 
@@ -91,7 +103,7 @@ class BCILoader:
         Load a single EEG recording (e.g., with mne.io.read_raw_*).
         Return an MNE Raw-like object.
         """
-        raw = mne.io.read_raw_gdf( file_path, preload=True)
+        raw = mne.io.read_raw_gdf(file_path, preload=True)
 
         events, event_id = mne.events_from_annotations(raw)
 
@@ -137,9 +149,81 @@ class BCILoader:
 
             raw.set_channel_types(types)
 
-config = PreprocConfig()
+    def process_all(self):
+        for raw in self.raw_files:
+            raw.notch_filter(freqs=[50, 100]);
 
-data_path = "data/BCICIV_2a_gdf"
+        log.debug("All raw files processed")
+    
+    def make_epochs(self, raw, events, event_id, tmin=-0.2, tmax=0.8):
+        """Helper: build mne.Epochs from raw + events."""
+        epochs = mne.Epochs(
+            raw,
+            events=events,
+            event_id=event_id,
+            tmin=tmin,
+            tmax=tmax,
+            baseline=(None, 0),
+            preload=True,
+            verbose="ERROR",
+            event_repeated="drop"
+        )
+        return epochs
 
-loader = BCILoader(config, data_path)
+    def save_epochs_fif(self, out_dir: str, tmin: float = -0.2, tmax: float = 0.8):
+        """Create Epochs and save each recording as .fif."""
+        os.makedirs(out_dir, exist_ok=True)
+
+        for raw, events, event_id, path, is_eval in zip(self.raw_files, self.events, self.event_ids, self.files, self.file_map):
+            epochs = self.make_epochs(raw, events, event_id, tmin, tmax)
+
+            stem = os.path.splitext(os.path.basename(path))[0]
+            split = "eval" if is_eval else "train"
+            out_path = os.path.join(out_dir, f"{stem}-{split}-epo.fif")
+
+            epochs.save(out_path, overwrite=True)
+            log.info(f"Saved epochs FIF: {out_path}")
+
+    def save_epochs_pt(self, out_dir: str, tmin: float = -0.2, tmax: float = 0.8):
+        """
+        Create Epochs and save each recording as torch .pt (safe for PyTorch 2.6+).
+        """
+        os.makedirs(out_dir, exist_ok=True)
+
+        for raw, events, event_id, path, is_eval in zip(self.raw_files, self.events, self.event_ids, self.files, self.file_map):
+            epochs = self.make_epochs(raw, events, event_id, tmin, tmax)
+
+            X = epochs.get_data()                      # (N, C, T) numpy
+            y = epochs.events[:, -1]                   # numpy labels
+            sfreq = float(epochs.info["sfreq"])        # ensure builtin float
+            ch_names = list(epochs.ch_names)           # list[str]
+            evmap = {str(k): int(v) for k, v in epochs.event_id.items()}  # builtin types
+            split = "eval" if is_eval else "train"
+            stem = os.path.splitext(os.path.basename(path))[0]
+            out_path = os.path.join(out_dir, f"{stem}-{split}-epo.pt")
+
+            # Convert arrays to tensors; keep meta as pure Python types
+            X_t = torch.as_tensor(X, dtype=torch.float32)
+            y_t = torch.as_tensor(y, dtype=torch.long)
+
+            torch.save(
+                {
+                    "X": X_t,                # torch.Tensor
+                    "y": y_t,                # torch.Tensor
+                    "sfreq": sfreq,          # float
+                    "ch_names": ch_names,    # list[str]
+                    "event_id": evmap,       # dict[str,int]
+                    "split": split,          # str
+                    "subject": stem,         # str
+                },
+                out_path,
+            )
+            log.info(f"Saved epochs PT: {out_path}")
+
+
+# config = PreprocConfig()
+
+# data_path = "data/BCICIV_2a_gdf"
+
+# loader = BCILoader(config, data_path)
 
